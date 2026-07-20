@@ -1,0 +1,20 @@
+Actúa como ingeniero Python experto en teledetección. Crea un script en Python 3 que descargue y muestre las últimas N imágenes satelitales reales en color verdadero (true color RGB) para un área de interés definida por Regiones de Chile y punto de interes por nombre, alternativamente por un bbox [min_lon, min_lat, max_lon, max_lat].
+
+Requisitos:
+- Fuente: Sentinel-2 L2A vía Copernicus Data Space / Sentinel Hub.
+- Debe traer las últimas N adquisiciones disponibles en orden descendente por fecha.
+- Debe buscar por Región y Punto de interés por nombre (ej: 'Tongoy', 'Ovalle'), geocodificado con Nominatim/OSM dentro de --region"
+- No filtrar por nubes: deben descargarse aunque esté nublado.
+- Solo imágenes diurnas / con luz solar: Sentinel-2 es un sensor óptico, así que usa sus adquisiciones visibles diurnas.
+- Las imágenes deben ser reales en color (bandas B04, B03, B02).
+- Debe guardar cada imagen como PNG en una carpeta de salida.
+- Debe mostrar un preview usando matplotlib.
+- Debe incluir autenticación por OAuth con variables de entorno:
+  SH_CLIENT_ID
+  SH_CLIENT_SECRET
+- Debe usar el Catalog API para buscar items y el Process API para renderizar cada imagen.
+- Debe manejar errores, rate limits básicos y casos con menos de N resultados.
+- Debe ser ejecutable tal cual, con imports y `requirements.txt` mínimos.
+- Añade comentarios breves y una función principal `download_latest_true_color_images(...)`.
+- Incluye un ejemplo de uso al final.
+- Python version 3.12.4 con venv
