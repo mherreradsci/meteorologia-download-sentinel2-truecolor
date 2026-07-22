@@ -41,6 +41,9 @@ python download_sentinel2_truecolor.py --region "Coquimbo" --point "Tongoy" -n 5
 # Por bbox explícito [min_lon, min_lat, max_lon, max_lat]
 python download_sentinel2_truecolor.py --bbox -71.7 -30.3 -71.3 -29.9 -n 3 --no-preview
 
+# Por archivo GeoJSON (bbox extraído de la geometría con shapely)
+python download_sentinel2_truecolor.py --geojson ./aoi/mi_area.geojson -n 3 --no-preview
+
 # Listar las regiones de Chile soportadas
 python download_sentinel2_truecolor.py --list-regions
 ```

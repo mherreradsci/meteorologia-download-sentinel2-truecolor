@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import logging
 import math
 import os
@@ -28,6 +29,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 import requests
+from shapely.geometry import shape
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("sentinel2_truecolor")
@@ -119,6 +121,10 @@ class CatalogError(Exception):
 
 
 class ProcessAPIError(Exception):
+    pass
+
+
+class GeoJSONError(Exception):
     pass
 
 
@@ -292,6 +298,33 @@ def point_to_bbox(lon: float, lat: float, buffer_km: float) -> List[float]:
     dlat = buffer_km / 111.32
     dlon = buffer_km / (111.32 * math.cos(math.radians(lat)))
     return [lon - dlon, lat - dlat, lon + dlon, lat + dlat]
+
+
+def bbox_from_geojson(path: str) -> List[float]:
+    """Extrae un bbox [min_lon, min_lat, max_lon, max_lat] de un archivo GeoJSON,
+    tomando la unión de los bounds de todas las geometrías encontradas. Soporta
+    FeatureCollection, Feature suelto, o una geometría GeoJSON directa."""
+    geojson_path = Path(path)
+    if not geojson_path.is_file():
+        raise GeoJSONError(f"Archivo GeoJSON no encontrado: {path}")
+    try:
+        data = json.loads(geojson_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise GeoJSONError(f"Archivo GeoJSON inválido '{path}': {exc}") from exc
+
+    gj_type = data.get("type")
+    if gj_type == "FeatureCollection":
+        geometries = [shape(f["geometry"]) for f in data.get("features", []) if f.get("geometry")]
+    elif gj_type == "Feature":
+        geometries = [shape(data["geometry"])] if data.get("geometry") else []
+    else:
+        geometries = [shape(data)]
+
+    if not geometries:
+        raise GeoJSONError(f"El archivo GeoJSON '{path}' no contiene geometrías.")
+
+    min_lons, min_lats, max_lons, max_lats = zip(*(g.bounds for g in geometries))
+    return [min(min_lons), min(min_lats), max(max_lons), max(max_lats)]
 
 
 def validate_bbox(bbox: List[float]) -> None:
@@ -545,6 +578,7 @@ def download_latest_true_color_images(
     region: Optional[str] = None,
     point: Optional[str] = None,
     bbox: Optional[List[float]] = None,
+    geojson: Optional[str] = None,
     buffer_km: float = 10.0,
     lookback_days: int = 30,
     max_lookback_days: int = 365,
@@ -557,10 +591,10 @@ def download_latest_true_color_images(
     client_secret: Optional[str] = None,
 ) -> List[Path]:
     """Descarga las últimas `n` imágenes true color (Sentinel-2 L2A) para el área
-    de interés indicada, ya sea por `bbox` explícito o por `region` + `point`
-    (geocodificado dentro de la región). Guarda cada imagen como PNG en
-    `output_dir`, muestra un preview con matplotlib (si `show_preview`) y
-    devuelve la lista de rutas guardadas."""
+    de interés indicada, ya sea por `bbox` explícito, por `geojson` (bbox extraído
+    de un archivo GeoJSON), o por `region` + `point` (geocodificado dentro de la
+    región). Guarda cada imagen como PNG en `output_dir`, muestra un preview con
+    matplotlib (si `show_preview`) y devuelve la lista de rutas guardadas."""
     load_dotenv_if_present()
     client_id = client_id or os.environ.get("SH_CLIENT_ID")
     client_secret = client_secret or os.environ.get("SH_CLIENT_SECRET")
@@ -572,8 +606,11 @@ def download_latest_true_color_images(
 
     has_bbox = bbox is not None
     has_region_point = region is not None and point is not None
-    if has_bbox == has_region_point:
-        raise ValueError("Debe indicar exactamente uno de: --bbox, o --region junto con --point.")
+    has_geojson = geojson is not None
+    if sum([has_bbox, has_region_point, has_geojson]) != 1:
+        raise ValueError(
+            "Debe indicar exactamente uno de: --bbox, --geojson, o --region junto con --point."
+        )
 
     session = requests.Session()
 
@@ -585,6 +622,11 @@ def download_latest_true_color_images(
         resolved_bbox = point_to_bbox(lon, lat, buffer_km)
         aoi_label = point
         log.info("Punto '%s' geocodificado en (%.4f, %.4f) -> bbox %s", point, lat, lon, resolved_bbox)
+    elif has_geojson:
+        assert geojson is not None
+        resolved_bbox = bbox_from_geojson(geojson)
+        aoi_label = Path(geojson).stem
+        log.info("Bbox %s extraído de geojson '%s'", resolved_bbox, geojson)
     else:
         assert bbox is not None
         resolved_bbox = list(bbox)
@@ -637,7 +679,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--bbox", nargs=4, type=float, metavar=("MIN_LON", "MIN_LAT", "MAX_LON", "MAX_LAT"),
-        help="Bbox explícito del área de interés (excluyente con --region/--point).",
+        help="Bbox explícito del área de interés (excluyente con --region/--point y --geojson).",
+    )
+    parser.add_argument(
+        "--geojson", type=str,
+        help="Ruta a un archivo GeoJSON cuyo bbox se usará como AOI "
+             "(excluyente con --bbox y --region/--point).",
     )
     parser.add_argument("--region", type=str, help="Nombre de la región de Chile (ver --list-regions).")
     parser.add_argument("--point", type=str, help="Nombre del punto de interés (ej: 'Tongoy').")
@@ -664,10 +711,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(name)
         return 0
 
-    if args.bbox and (args.region or args.point):
-        parser.error("--bbox es excluyente con --region/--point.")
-    if not args.bbox and not (args.region and args.point):
-        parser.error("Debe indicar --bbox, o bien --region junto con --point.")
+    aoi_flags_set = sum([bool(args.bbox), bool(args.geojson), bool(args.region or args.point)])
+    if aoi_flags_set > 1:
+        parser.error("--bbox, --geojson y --region/--point son mutuamente excluyentes.")
+    if aoi_flags_set == 0:
+        parser.error("Debe indicar --bbox, --geojson, o bien --region junto con --point.")
+    if bool(args.region) != bool(args.point):
+        parser.error("--region y --point deben usarse juntos.")
     if args.count is None:
         parser.error("-n/--count es requerido.")
 
@@ -678,6 +728,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             region=args.region,
             point=args.point,
             bbox=args.bbox,
+            geojson=args.geojson,
             buffer_km=args.buffer_km,
             lookback_days=args.lookback_days,
             max_lookback_days=args.max_lookback_days,
@@ -687,7 +738,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             gamma=args.gamma,
             show_preview=not args.no_preview,
         )
-    except (AuthError, GeocodingError, CatalogError, ProcessAPIError, ValueError) as exc:
+    except (AuthError, GeocodingError, CatalogError, ProcessAPIError, GeoJSONError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     except requests.RequestException as exc:
@@ -710,6 +761,10 @@ if __name__ == "__main__":
     #
     #   # Por bbox explícito
     #   python download_sentinel2_truecolor.py --bbox -71.7 -30.3 -71.3 -29.9 \
+    #       -n 3 --no-preview
+    #
+    #   # Por archivo GeoJSON (bbox extraído de la geometría)
+    #   python download_sentinel2_truecolor.py --geojson ./aoi/mi_area.geojson \
     #       -n 3 --no-preview
     # ------------------------------------------------------------------------------
     sys.exit(main())

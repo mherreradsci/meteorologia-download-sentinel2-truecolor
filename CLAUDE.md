@@ -33,6 +33,9 @@ python download_sentinel2_truecolor.py --region "Coquimbo" --point "Tongoy" -n 5
 # By explicit bbox [min_lon, min_lat, max_lon, max_lat]
 python download_sentinel2_truecolor.py --bbox -71.7 -30.3 -71.3 -29.9 -n 3 --no-preview
 
+# By GeoJSON file (bbox extracted from the geometry via shapely)
+python download_sentinel2_truecolor.py --geojson ./aoi/mi_area.geojson -n 3 --no-preview
+
 # List supported Chile regions
 python download_sentinel2_truecolor.py --list-regions
 ```
@@ -54,12 +57,16 @@ The script is organized as a linear pipeline, all driven from
 `download_latest_true_color_images(...)` (the "main" function referenced by the CLI and meant
 to be reusable programmatically):
 
-1. **AOI resolution** — either an explicit `--bbox`, or `--region` + `--point`. For the
-   region+point path: `normalize_region_name()` resolves the region against `CHILE_REGIONS`
-   (accent/case-insensitive), then `geocode_point()` calls Nominatim scoped to that region's
-   bbox, then `point_to_bbox()` expands the point into a bbox using `--buffer-km`.
+1. **AOI resolution** — exactly one of: an explicit `--bbox`, `--region` + `--point`, or
+   `--geojson`. For the region+point path: `normalize_region_name()` resolves the region against
+   `CHILE_REGIONS` (accent/case-insensitive), then `geocode_point()` calls Nominatim scoped to
+   that region's bbox, then `point_to_bbox()` expands the point into a bbox using `--buffer-km`.
    `CHILE_REGIONS` bboxes are coarse — used only to bound/validate geocoding, not as
-   administrative boundaries.
+   administrative boundaries. For `--geojson`, `bbox_from_geojson()` reads the file (accepting a
+   `FeatureCollection`, a bare `Feature`, or a raw geometry) and uses shapely to take the union
+   bounds of all geometries found; no buffer is applied, since the geometry already defines the
+   precise boundary. The AOI label used in output filenames is the point name, a `bbox_...`
+   slug, or the geojson filename stem, respectively.
 2. **Auth** — `TokenManager` caches a CDSE OAuth token and refetches it ~60s before expiry.
 3. **Catalog search** — `find_latest_items()` queries `search_catalog()` (Sentinel Hub Catalog
    API) over a date window, filters via `is_probably_daytime()`, and sorts descending by date.
