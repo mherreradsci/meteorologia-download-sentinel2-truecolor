@@ -487,7 +487,11 @@ def fetch_true_color_image(
 # --------------------------------------------------------------------------------------
 
 def build_output_filename(aoi_label: str, item: dict) -> str:
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", aoi_label).strip("_") or "aoi"
+    # Solo se reemplazan caracteres no imprimibles (de control, etc.) por "_";
+    # se preservan letras acentuadas/ñ y demás caracteres imprimibles de
+    # aoi_label para mantener nombres de archivo legibles.
+    slug = "".join(c if c.isprintable() else "_" for c in aoi_label)
+    slug = re.sub(r"_+", "_", slug).strip("_") or "aoi"
     # Timestamp real de adquisición (UTC, precisión de segundos) tomado de
     # properties.datetime -- no solo la fecha, porque un mismo tile puede
     # tener más de una adquisición el mismo día (p.ej. distintas órbitas

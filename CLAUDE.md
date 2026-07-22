@@ -37,8 +37,16 @@ python download_sentinel2_truecolor.py --bbox -71.7 -30.3 -71.3 -29.9 -n 3 --no-
 python download_sentinel2_truecolor.py --list-regions
 ```
 
-There is no test suite, linter, or CI config in this repo — don't assume `pytest`/`ruff`/etc.
-are available unless you add them yourself.
+There is a small `tests/` suite (pytest) covering `build_output_filename`'s filename-sanitization
+logic — see `tests/test_build_output_filename.py`. Install dev deps and run it with:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/
+```
+
+Beyond that, there is no linter or CI config in this repo — don't assume `ruff`/etc. are
+available unless you add them yourself.
 
 ## Architecture
 
