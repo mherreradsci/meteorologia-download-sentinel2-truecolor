@@ -9,6 +9,10 @@ A single-script tool (`download_sentinel2_truecolor.py`) that downloads the late
 Copernicus Data Space Ecosystem (CDSE) Sentinel Hub Catalog API + Process API. There is no
 package structure, build system, or test suite — everything lives in this one file.
 
+`prompt-inicial.txt` is the original one-off spec prompt used to generate the first version of
+the script. It is kept only for historical reference — do not read it or treat it as the current
+requirements; requirements evolve from conversation with the user, not from that file.
+
 ## Setup and running
 
 ```bash
