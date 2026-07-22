@@ -1,5 +1,7 @@
 # Sentinel-2 True Color Downloader (Chile)
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Descarga las últimas N imágenes reales en color verdadero (RGB, bandas B04/B03/B02)
 de Sentinel-2 L2A para un área de interés en Chile, vía la Copernicus Data Space
 Ecosystem (CDSE) Sentinel Hub Catalog API + Process API. No filtra por nubosidad.
