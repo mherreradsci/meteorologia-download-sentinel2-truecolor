@@ -520,10 +520,10 @@ def fetch_true_color_image(
 # --------------------------------------------------------------------------------------
 
 def build_output_filename(aoi_label: str, item: dict) -> str:
-    # Solo se reemplazan caracteres no imprimibles (de control, etc.) por "_";
+    # Solo se reemplazan caracteres no imprimibles (de control, etc.) y espacios por "_";
     # se preservan letras acentuadas/ñ y demás caracteres imprimibles de
     # aoi_label para mantener nombres de archivo legibles.
-    slug = "".join(c if c.isprintable() else "_" for c in aoi_label)
+    slug = "".join(c if not c.isspace() and c.isprintable() else "_" for c in aoi_label)
     slug = re.sub(r"_+", "_", slug).strip("_") or "aoi"
     # Timestamp real de adquisición (UTC, precisión de segundos) tomado de
     # properties.datetime -- no solo la fecha, porque un mismo tile puede
@@ -536,7 +536,7 @@ def build_output_filename(aoi_label: str, item: dict) -> str:
     # contra colisiones/overwrites (p.ej. reprocesos con igual timestamp).
     item_id = str(item.get("id", "na"))
     item_id_short = hashlib.sha1(item_id.encode("utf-8")).hexdigest()[:8]
-    return f"{slug}_{timestamp}_{item_id_short}.png"
+    return f"{slug}-{timestamp}-{item_id_short}.png"
 
 
 def save_png(image_bytes: bytes, output_dir: Path, filename: str) -> Path:
