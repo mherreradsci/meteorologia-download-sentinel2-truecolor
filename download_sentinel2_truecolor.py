@@ -31,7 +31,17 @@ from typing import Callable, Dict, List, Optional, Tuple
 import requests
 from shapely.geometry import shape
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+def _resolve_log_level_from_env(default: int = logging.INFO) -> int:
+    """Nivel de logging leído de LOGLEVEL (nombre estándar: DEBUG/INFO/WARNING/...).
+    Si no está seteada o no es un nombre válido, usa `default`."""
+    env_level = os.environ.get("LOGLEVEL")
+    if not env_level:
+        return default
+    resolved = getattr(logging, env_level.strip().upper(), None)
+    return resolved if isinstance(resolved, int) else default
+
+
+logging.basicConfig(level=_resolve_log_level_from_env(), format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("sentinel2_truecolor")
 
 # --------------------------------------------------------------------------------------
@@ -177,6 +187,7 @@ def retry_with_backoff(
                         func.__name__, exc, sleep_s, attempt + 1, max_retries,
                     )
                     time.sleep(sleep_s)
+            assert last_exc is not None  # el for siempre retorna o re-lanza en el último intento
             raise last_exc  # pragma: no cover - inalcanzable en la práctica
         return wrapper
     return decorator
@@ -403,6 +414,11 @@ def is_probably_daytime(item: dict) -> bool:
     props = item.get("properties", {})
     sun_elevation = props.get("sun_elevation", props.get("view:sun_elevation"))
     if sun_elevation is not None and sun_elevation <= 0:
+        log.debug(
+            "Descartando ítem %s por sun_elevation=%s (no diurno).",
+            item.get("id", "?"),
+            sun_elevation,
+        )
         return False
     return True
 
@@ -555,7 +571,7 @@ def preview_images(image_paths: List[Path], titles: List[str]) -> None:
     n = len(image_paths)
     cols = math.ceil(math.sqrt(n))
     rows = math.ceil(n / cols)
-    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows))
+    _, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows))
     axes = [axes] if n == 1 else axes.flatten()
     for ax, path, title in zip(axes, image_paths, titles):
         img = plt.imread(path)
@@ -699,12 +715,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gamma", type=float, default=1.0, help="Gamma del realce true color.")
     parser.add_argument("--no-preview", action="store_true", help="No mostrar preview con matplotlib.")
     parser.add_argument("--list-regions", action="store_true", help="Listar las regiones de Chile soportadas y salir.")
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="Fuerza nivel de logging DEBUG (prioridad sobre la variable de entorno LOGLEVEL).",
+    )
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     if args.list_regions:
         for name in sorted(CHILE_REGIONS):
