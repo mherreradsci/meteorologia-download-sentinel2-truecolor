@@ -5,3 +5,5 @@ __pycache__/
 output/
 salidas*/
 test_*/
+.vscode/*
+!.vscode/settings.json
