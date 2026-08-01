@@ -8,6 +8,7 @@ from download_sentinel2_truecolor import GeoJSONError, bbox_from_geojson
 SAMPLE_GEOJSON = str(
     Path(__file__).parent.parent
     / "aoi"
+    / "04-Coquimbo"
     / "Chile-Region_de_Coquimbo-La_huiguera-Chungungo.geojson"
 )
 
