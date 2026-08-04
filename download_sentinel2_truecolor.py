@@ -23,6 +23,7 @@ import re
 import sys
 import time
 import unicodedata
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
@@ -368,6 +369,108 @@ def compute_image_dimensions(
     return width_px, height_px
 
 
+@dataclass
+class TileSpec:
+    """Un sub-bbox de la grilla de mosaico, con su posición en píxeles dentro
+    del canvas final. (x0, y0) es la esquina superior izquierda, (x1, y1) la
+    inferior derecha (exclusiva) -- misma convención que PIL.Image.paste."""
+
+    bbox: List[float]
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+
+    @property
+    def width(self) -> int:
+        return self.x1 - self.x0
+
+    @property
+    def height(self) -> int:
+        return self.y1 - self.y0
+
+
+def compute_regional_grid(
+    bbox: List[float],
+    tile_km: float,
+    resolution_m: float,
+    max_image_dim: int,
+    hard_cap: int = 2500,
+) -> Tuple[List[TileSpec], int, int]:
+    """Divide `bbox` en una grilla de sub-bboxes de ~`tile_km` de lado, pensada
+    para que cada tile quede bien adentro de una sola pasada (swath) de
+    Sentinel-2 (~290 km de ancho), evitando el corte diagonal de nodata que
+    aparece al pedir una sola imagen sobre un AOI más grande que eso -- el
+    swath es diagonal en vez de alineado a lat/lon porque la órbita es casi
+    polar (~98° de inclinación), no vertical.
+
+    Usa una latitud de referencia única (el centro de `bbox`) para la
+    conversión grados<->metros de TODA la grilla, no una por tile: si cada
+    fila usara su propio cos(lat), el ancho en píxeles de cada tile
+    divergiría ligeramente del de sus vecinos y quedarían costuras visibles
+    al pegar el mosaico. La escala efectiva resultante es la misma que
+    devolvería `compute_image_dimensions` para el bbox completo, así que el
+    canvas final respeta `max_image_dim` igual que el modo de una sola
+    imagen.
+
+    Los offsets en píxeles de cada tile se calculan como una posición
+    absoluta redondeada desde el origen del bbox (no como una suma de
+    anchos de tile redondeados por separado), así los tiles calzan exactos
+    en el canvas sin overlap ni gaps de redondeo."""
+    if tile_km <= 0:
+        raise ValueError(f"tile_km debe ser positivo, se recibió {tile_km}.")
+
+    min_lon, min_lat, max_lon, max_lat = bbox
+    ref_lat = (min_lat + max_lat) / 2
+    m_per_deg_lon = 111_320 * math.cos(math.radians(ref_lat))
+    m_per_deg_lat = 110_540
+
+    raw_width_px = (max_lon - min_lon) * m_per_deg_lon / resolution_m
+    raw_height_px = (max_lat - min_lat) * m_per_deg_lat / resolution_m
+    scale = min(1.0, max_image_dim / max(raw_width_px, raw_height_px))
+    eff_resolution_m = resolution_m / scale
+
+    def px_x(lon: float) -> int:
+        return round((lon - min_lon) * m_per_deg_lon / eff_resolution_m)
+
+    def px_y(lat: float) -> int:
+        return round((max_lat - lat) * m_per_deg_lat / eff_resolution_m)
+
+    tile_deg_lon = tile_km * 1000 / m_per_deg_lon
+    tile_deg_lat = tile_km * 1000 / m_per_deg_lat
+    n_cols = max(1, math.ceil((max_lon - min_lon) / tile_deg_lon))
+    n_rows = max(1, math.ceil((max_lat - min_lat) / tile_deg_lat))
+
+    tiles: List[TileSpec] = []
+    for row in range(n_rows):
+        tile_max_lat = max_lat - row * tile_deg_lat
+        tile_min_lat = max(min_lat, tile_max_lat - tile_deg_lat)
+        for col in range(n_cols):
+            tile_min_lon = min_lon + col * tile_deg_lon
+            tile_max_lon = min(max_lon, tile_min_lon + tile_deg_lon)
+            x0, x1 = px_x(tile_min_lon), px_x(tile_max_lon)
+            y0, y1 = px_y(tile_max_lat), px_y(tile_min_lat)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            tiles.append(
+                TileSpec(
+                    bbox=[tile_min_lon, tile_min_lat, tile_max_lon, tile_max_lat],
+                    x0=x0, y0=y0, x1=x1, y1=y1,
+                )
+            )
+
+    canvas_w = px_x(max_lon)
+    canvas_h = px_y(min_lat)
+    for t in tiles:
+        if t.width > hard_cap or t.height > hard_cap:
+            raise ValueError(
+                f"Tile {t.bbox} pide {t.width}x{t.height}px, sobre el límite de "
+                f"{hard_cap}px de la Process API. Usá --tile-km más chico o "
+                f"--max-image-dim más chico."
+            )
+    return tiles, canvas_w, canvas_h
+
+
 # --------------------------------------------------------------------------------------
 # Catalog API
 # --------------------------------------------------------------------------------------
@@ -405,6 +508,26 @@ def search_catalog(
             raise CatalogError(f"Catalog API devolvió {response.status_code}: {response.text}") from exc
         raise  # deja que retry_with_backoff reintente los códigos transitorios
     return response.json().get("features", [])
+
+
+@retry_with_backoff()
+def _fetch_catalog_page(session: requests.Session, token_manager: TokenManager, body: dict) -> dict:
+    """POST crudo a la Catalog API devolviendo la respuesta completa (no solo
+    'features' como search_catalog), para poder seguir el link de paginación
+    'next' -- la API cadena páginas de hasta 100 ítems cada una."""
+    response = session.post(
+        SH_CATALOG_URL,
+        json=body,
+        headers={"Authorization": f"Bearer {token_manager.token}"},
+        timeout=30,
+    )
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        if response.status_code not in (429, 500, 502, 503, 504):
+            raise CatalogError(f"Catalog API devolvió {response.status_code}: {response.text}") from exc
+        raise  # deja que retry_with_backoff reintente los códigos transitorios
+    return response.json()
 
 
 def is_probably_daytime(item: dict) -> bool:
@@ -447,6 +570,65 @@ def find_latest_items(
     if len(items) < n:
         log.warning("Solo se encontraron %d/%d ítems dentro de %d días.", len(items), n, window)
     return items[:n]
+
+
+def find_latest_distinct_dates(
+    session: requests.Session,
+    token_manager: TokenManager,
+    bbox: List[float],
+    count: int,
+    max_lookback_days: int,
+    max_items: int = 2000,
+) -> List[str]:
+    """Busca, sobre `bbox`, las `count` fechas (YYYY-MM-DD) más recientes en
+    que hubo al menos una adquisición Sentinel-2 L2A. Define los cortes
+    temporales de una serie de mosaicos regionales (`download_regional_mosaic`
+    con `count > 1`): un bbox grande (varios tiles) puede tener varios ítems
+    (distintas órbitas/tiles) el mismo día, que acá cuentan como una sola
+    fecha.
+
+    Confirmado en vivo contra la Catalog API real: los ítems vienen
+    ordenados del más reciente al más antiguo, y la respuesta trae paginación
+    real (`context`/`links` con `rel: next`) -- por eso esta función pagina
+    en vez de ensanchar la ventana de fechas como `find_latest_items`. Antes
+    se pedía una sola página de 100 ítems por consulta y se reintentaba con
+    una ventana más ancha si `count` no se alcanzaba, pero como la API ya
+    devuelve los más recientes primero sin importar cuán atrás llegue el
+    filtro de fecha, esa primera página de 100 es siempre la misma sin
+    importar la ventana -- ensanchar nunca ayudaba, solo repetía la consulta.
+    `max_items` es un techo de seguridad (no expuesto en la CLI) para no
+    paginar sin límite si `count` es muy alto sobre un AOI con cobertura
+    densa continua."""
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=max_lookback_days)
+    body = {
+        "collections": [COLLECTION],
+        "bbox": bbox,
+        "datetime": f"{start:%Y-%m-%dT00:00:00Z}/{end:%Y-%m-%dT23:59:59Z}",
+        "limit": 100,
+    }
+    dates: set = set()
+    items_seen = 0
+    while True:
+        page = _fetch_catalog_page(session, token_manager, body)
+        features = page.get("features", [])
+        items_seen += len(features)
+        dates.update(f["properties"]["datetime"][:10] for f in features if is_probably_daytime(f))
+        if len(dates) >= count or items_seen >= max_items:
+            break
+        next_link = next((link for link in page.get("links", []) if link.get("rel") == "next"), None)
+        if next_link is None:
+            break
+        next_body = next_link.get("body", {})
+        body = {**body, **next_body} if next_link.get("merge") else next_body
+
+    sorted_dates = sorted(dates, reverse=True)
+    if len(sorted_dates) < count:
+        log.warning(
+            "Solo se encontraron %d/%d fechas distintas tras revisar %d ítems (máx %d) en %d días.",
+            len(sorted_dates), count, items_seen, max_items, max_lookback_days,
+        )
+    return sorted_dates[:count]
 
 
 # --------------------------------------------------------------------------------------
@@ -535,12 +717,17 @@ def fetch_true_color_image(
 # Guardado y preview
 # --------------------------------------------------------------------------------------
 
-def build_output_filename(aoi_label: str, item: dict) -> str:
+def _slugify_label(label: str) -> str:
     # Solo se reemplazan caracteres no imprimibles (de control, etc.) y espacios por "_";
     # se preservan letras acentuadas/ñ y demás caracteres imprimibles de
-    # aoi_label para mantener nombres de archivo legibles.
-    slug = "".join(c if not c.isspace() and c.isprintable() else "_" for c in aoi_label)
-    slug = re.sub(r"_+", "_", slug).strip("_") or "aoi"
+    # label para mantener nombres de archivo legibles.
+    slug = "".join(c if not c.isspace() and c.isprintable() else "_" for c in label)
+    slug = re.sub(r"_+", "_", slug).strip("_")
+    return slug or "aoi"
+
+
+def build_output_filename(aoi_label: str, item: dict) -> str:
+    slug = _slugify_label(aoi_label)
     # Timestamp real de adquisición (UTC, precisión de segundos) tomado de
     # properties.datetime -- no solo la fecha, porque un mismo tile puede
     # tener más de una adquisición el mismo día (p.ej. distintas órbitas
@@ -553,6 +740,38 @@ def build_output_filename(aoi_label: str, item: dict) -> str:
     item_id = str(item.get("id", "na"))
     item_id_short = hashlib.sha1(item_id.encode("utf-8")).hexdigest()[:8]
     return f"{slug}-{timestamp}-{item_id_short}.png"
+
+
+def build_mosaic_filename(aoi_label: str, date_range: str, n_tiles: int) -> str:
+    """Nombre de archivo para el mosaico compuesto. No hay un único `item`
+    STAC del que derivar timestamp/id (el mosaico junta N tiles, cada uno
+    con su propia fecha), así que el hash se deriva de slug+date_range+
+    n_tiles en su lugar -- mismo propósito anti-colisión que en
+    build_output_filename, adaptado a que acá no hay un id de item real."""
+    slug = _slugify_label(aoi_label)
+    tag = hashlib.sha1(f"{slug}-{date_range}-{n_tiles}".encode("utf-8")).hexdigest()[:8]
+    return f"{slug}_mosaic_{date_range}_{n_tiles}tiles_{tag}.png"
+
+
+def fraction_black(image_bytes: bytes, threshold: int = 8) -> float:
+    """Fracción de píxeles "negros" (nodata) en un PNG, entendido como
+    luminancia por debajo de `threshold`. Sirve para detectar tiles que en
+    su mayoría cayeron fuera del swath de la adquisición elegida, sin
+    depender de que la Process API exponga una máscara de nodata explícita
+    (entrega un PNG plano, sin canal alfa de validez). Real: con gain=2.5 y
+    gamma=1.0, un píxel de reflectancia real rara vez cae en (0,0,0) exacto
+    en los tres canales a la vez -- eso sí es lo que la API rellena fuera
+    del área con datos."""
+    from PIL import Image
+    import io
+
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        gray = img.convert("L")
+        total = gray.width * gray.height
+        if total == 0:
+            return 0.0
+        black = sum(gray.histogram()[:threshold])
+    return black / total
 
 
 def save_png(image_bytes: bytes, output_dir: Path, filename: str) -> Path:
@@ -582,6 +801,52 @@ def preview_images(image_paths: List[Path], titles: List[str]) -> None:
         ax.axis("off")
     plt.tight_layout()
     plt.show()
+
+
+# --------------------------------------------------------------------------------------
+# Resolución de AOI (compartida entre el flujo de un solo bbox y el de mosaico en tiles)
+# --------------------------------------------------------------------------------------
+
+def resolve_aoi(
+    session: requests.Session,
+    region: Optional[str] = None,
+    point: Optional[str] = None,
+    bbox: Optional[List[float]] = None,
+    geojson: Optional[str] = None,
+    buffer_km: float = 10.0,
+) -> Tuple[List[float], str]:
+    """Resuelve el AOI a un bbox [min_lon, min_lat, max_lon, max_lat] + una etiqueta legible
+    para nombres de archivo, a partir de exactamente uno de: --bbox, --geojson, o
+    --region junto con --point. Válida el bbox resultante (validate_bbox) antes de
+    devolverlo."""
+    has_bbox = bbox is not None
+    has_region_point = region is not None and point is not None
+    has_geojson = geojson is not None
+    if sum([has_bbox, has_region_point, has_geojson]) != 1:
+        raise ValueError(
+            "Debe indicar exactamente uno de: --bbox, --geojson, o --region junto con --point."
+        )
+
+    if has_region_point:
+        assert region is not None and point is not None
+        region_name = normalize_region_name(region)
+        region_bbox = CHILE_REGIONS[region_name]
+        lon, lat = geocode_point(point, region_name, region_bbox, session)
+        resolved_bbox = point_to_bbox(lon, lat, buffer_km)
+        aoi_label = point
+        log.info("Punto '%s' geocodificado en (%.4f, %.4f) -> bbox %s", point, lat, lon, resolved_bbox)
+    elif has_geojson:
+        assert geojson is not None
+        resolved_bbox = bbox_from_geojson(geojson)
+        aoi_label = Path(geojson).stem
+        log.info("Bbox %s extraído de geojson '%s'", resolved_bbox, geojson)
+    else:
+        assert bbox is not None
+        resolved_bbox = list(bbox)
+        aoi_label = f"bbox_{resolved_bbox[0]:.2f}_{resolved_bbox[1]:.2f}"
+
+    validate_bbox(resolved_bbox)
+    return resolved_bbox, aoi_label
 
 
 # --------------------------------------------------------------------------------------
@@ -620,35 +885,8 @@ def download_latest_true_color_images(
             "como variables de entorno o páselas explícitamente."
         )
 
-    has_bbox = bbox is not None
-    has_region_point = region is not None and point is not None
-    has_geojson = geojson is not None
-    if sum([has_bbox, has_region_point, has_geojson]) != 1:
-        raise ValueError(
-            "Debe indicar exactamente uno de: --bbox, --geojson, o --region junto con --point."
-        )
-
     session = requests.Session()
-
-    if has_region_point:
-        assert region is not None and point is not None
-        region_name = normalize_region_name(region)
-        region_bbox = CHILE_REGIONS[region_name]
-        lon, lat = geocode_point(point, region_name, region_bbox, session)
-        resolved_bbox = point_to_bbox(lon, lat, buffer_km)
-        aoi_label = point
-        log.info("Punto '%s' geocodificado en (%.4f, %.4f) -> bbox %s", point, lat, lon, resolved_bbox)
-    elif has_geojson:
-        assert geojson is not None
-        resolved_bbox = bbox_from_geojson(geojson)
-        aoi_label = Path(geojson).stem
-        log.info("Bbox %s extraído de geojson '%s'", resolved_bbox, geojson)
-    else:
-        assert bbox is not None
-        resolved_bbox = list(bbox)
-        aoi_label = f"bbox_{resolved_bbox[0]:.2f}_{resolved_bbox[1]:.2f}"
-
-    validate_bbox(resolved_bbox)
+    resolved_bbox, aoi_label = resolve_aoi(session, region, point, bbox, geojson, buffer_km)
 
     token_manager = TokenManager(client_id, client_secret, session)
     width, height = compute_image_dimensions(resolved_bbox, resolution_m, max_image_dim)
@@ -685,6 +923,154 @@ def download_latest_true_color_images(
     return saved_paths
 
 
+def download_regional_mosaic(
+    output_dir: str = "output",
+    region: Optional[str] = None,
+    point: Optional[str] = None,
+    bbox: Optional[List[float]] = None,
+    geojson: Optional[str] = None,
+    buffer_km: float = 10.0,
+    tile_km: float = 100.0,
+    count: int = 1,
+    max_lookback_days: int = 365,
+    resolution_m: float = 10.0,
+    max_image_dim: int = 2000,
+    gain: float = 2.5,
+    gamma: float = 1.0,
+    black_fraction_threshold: float = 0.05,
+    keep_tiles: bool = False,
+    show_preview: bool = True,
+    client_id: Optional[str] = None,
+    client_secret: Optional[str] = None,
+) -> List[Path]:
+    """Arma `count` mosaicos true color de un AOI grande, dividiéndolo en
+    tiles del tamaño de un swath de Sentinel-2 (`tile_km`) para evitar el
+    corte diagonal de nodata que aparece al pedir una sola imagen para un
+    AOI más ancho que una pasada (ver `compute_regional_grid`).
+
+    Primero se eligen los `count` cortes temporales con `find_latest_distinct_dates`
+    sobre el AOI completo (las fechas más recientes con al menos una
+    adquisición en algún punto del AOI); con `count=1` (el default) esa
+    fecha es, por construcción, la más reciente de cualquier tile individual,
+    así que el comportamiento coincide con "el mosaico más reciente posible"
+    sin necesidad de un caso especial.
+
+    Cada mosaico es un compuesto estricto de una sola fecha UTC (requisito
+    del caso de uso: contrastar imagen de fecha conocida contra mapas de
+    susceptibilidad de inundación). Para cada fecha objetivo, cada tile
+    consulta el Catalog API por separado (la cobertura varía por ubicación)
+    y, solo si tiene al menos una adquisición diurna en esa fecha exacta,
+    descarga la imagen del día completo: la Process API compone server-side
+    todas las pasadas de ese día (`mosaickingOrder: mostRecent` sobre el
+    rango 00:00-23:59Z), así que las adquisiciones de una misma fecha ya se
+    rellenan entre sí sin compositing cliente-lado. Un tile sin cobertura
+    esa fecha queda en negro (nodata honesto), y uno cubierto solo
+    parcialmente conserva el negro fuera del swath -- se loguea un warning
+    si la fracción negra supera `black_fraction_threshold`, pero nunca se
+    rellena con datos de otra fecha. Los tiles se pegan en un único canvas
+    por fecha según los offsets en píxeles de `compute_regional_grid`, que
+    calzan exactos sin costuras."""
+    from PIL import Image
+    import io
+
+    load_dotenv_if_present()
+    client_id = client_id or os.environ.get("SH_CLIENT_ID")
+    client_secret = client_secret or os.environ.get("SH_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        raise AuthError(
+            "Faltan credenciales OAuth: defina SH_CLIENT_ID y SH_CLIENT_SECRET "
+            "como variables de entorno o páselas explícitamente."
+        )
+
+    session = requests.Session()
+    resolved_bbox, aoi_label = resolve_aoi(session, region, point, bbox, geojson, buffer_km)
+    token_manager = TokenManager(client_id, client_secret, session)
+
+    tiles, canvas_w, canvas_h = compute_regional_grid(resolved_bbox, tile_km, resolution_m, max_image_dim)
+    log.info(
+        "AOI dividido en %d tile(s) para un canvas de %dx%d px (tile_km=%.1f)",
+        len(tiles), canvas_w, canvas_h, tile_km,
+    )
+
+    target_dates = find_latest_distinct_dates(session, token_manager, resolved_bbox, count, max_lookback_days)
+    if not target_dates:
+        raise CatalogError("No se encontraron adquisiciones Sentinel-2 L2A para el área/periodo indicado.")
+
+    evalscript = build_true_color_evalscript(gain, gamma)
+    tile_dir = Path(output_dir) / "tiles" if keep_tiles else None
+    saved_paths: List[Path] = []
+    titles: List[str] = []
+
+    for date_idx, target_date in enumerate(target_dates):
+        day = datetime.strptime(target_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        canvas = Image.new("RGB", (canvas_w, canvas_h), (0, 0, 0))
+        any_success = False
+
+        for idx, tile in enumerate(tiles):
+            raw_items = search_catalog(session, token_manager, tile.bbox, day, day, 20)
+            if not any(is_probably_daytime(i) for i in raw_items):
+                log.info(
+                    "Mosaico %s, tile %d/%d %s: sin adquisiciones esa fecha, queda en negro.",
+                    target_date, idx + 1, len(tiles), tile.bbox,
+                )
+                continue
+
+            try:
+                png_bytes = fetch_true_color_image(
+                    session, token_manager, tile.bbox, target_date, tile.width, tile.height, evalscript
+                )
+            except (ProcessAPIError, requests.RequestException) as exc:
+                log.warning(
+                    "Mosaico %s, tile %d/%d %s falló: %s; queda en negro.",
+                    target_date, idx + 1, len(tiles), tile.bbox, exc,
+                )
+                continue
+
+            black = fraction_black(png_bytes)
+            if black > black_fraction_threshold:
+                log.warning(
+                    "Mosaico %s, tile %d/%d %s: %.0f%% nodata -- la(s) pasada(s) de esa fecha no "
+                    "cubren el tile completo; se conserva el negro para no mezclar fechas.",
+                    target_date, idx + 1, len(tiles), tile.bbox, black * 100,
+                )
+
+            with Image.open(io.BytesIO(png_bytes)) as tile_img:
+                canvas.paste(tile_img.convert("RGB"), (tile.x0, tile.y0))
+            any_success = True
+
+            if tile_dir is not None:
+                tile_dir.mkdir(parents=True, exist_ok=True)
+                (tile_dir / f"{aoi_label}_{target_date}_tile{idx:03d}.png").write_bytes(png_bytes)
+
+            log.info(
+                "Mosaico %s, tile %d/%d %s: %.0f%% negro",
+                target_date, idx + 1, len(tiles), tile.bbox, black * 100,
+            )
+
+        if not any_success:
+            log.warning("Mosaico %s: ningún tile con datos, se omite.", target_date)
+            continue
+
+        buf = io.BytesIO()
+        canvas.save(buf, format="PNG")
+        filename = build_mosaic_filename(aoi_label, target_date, len(tiles))
+        path = save_png(buf.getvalue(), Path(output_dir), filename)
+        saved_paths.append(path)
+        titles.append(target_date)
+        log.info(
+            "Mosaico %d/%d guardado en %s (%d tiles, fecha %s)",
+            date_idx + 1, len(target_dates), path, len(tiles), target_date,
+        )
+
+    if not saved_paths:
+        raise ProcessAPIError("Todos los mosaicos fallaron.")
+
+    if show_preview:
+        preview_images(saved_paths, titles)
+
+    return saved_paths
+
+
 # --------------------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------------------
@@ -704,15 +1090,46 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--region", type=str, help="Nombre de la región de Chile (ver --list-regions).")
     parser.add_argument("--point", type=str, help="Nombre del punto de interés (ej: 'Tongoy').")
-    parser.add_argument("-n", "--count", type=int, help="Cantidad de imágenes a descargar.")
+    parser.add_argument(
+        "-n", "--count", type=int,
+        help="Cantidad de imágenes a descargar (o de mosaicos, con --tile-km; "
+             "default 1 en ese modo, requerido en el modo de una sola pieza).",
+    )
     parser.add_argument("--output-dir", type=str, default="output", help="Carpeta de salida para los PNG.")
     parser.add_argument("--buffer-km", type=float, default=10.0, help="Semi-buffer en km alrededor del punto geocodificado.")
-    parser.add_argument("--lookback-days", type=int, default=30, help="Ventana inicial de búsqueda, en días.")
+    parser.add_argument(
+        "--lookback-days", type=int, default=30,
+        help="Ventana inicial de búsqueda, en días (sin efecto en modo mosaico, --tile-km).",
+    )
     parser.add_argument("--max-lookback-days", type=int, default=365, help="Ventana máxima de búsqueda, en días.")
     parser.add_argument("--resolution-m", type=float, default=10.0, help="Resolución objetivo en metros/píxel.")
     parser.add_argument("--max-image-dim", type=int, default=2000, help="Lado máximo de la imagen en píxeles.")
     parser.add_argument("--gain", type=float, default=2.5, help="Ganancia del realce true color.")
     parser.add_argument("--gamma", type=float, default=1.0, help="Gamma del realce true color.")
+    parser.add_argument(
+        "--tile-km", type=float, default=None,
+        help="Activa el modo mosaico: divide el AOI en tiles de ~N km de lado "
+             "(del tamaño de un swath de Sentinel-2) y arma composites en vez de "
+             "descargar N imágenes de una sola pieza. Pensado para AOIs más "
+             "anchos que una pasada (p.ej. una región entera), donde pedir una "
+             "sola imagen deja gran parte del área en negro (nodata fuera del "
+             "swath). Con -n/--count > 1 arma esa cantidad de mosaicos, uno por "
+             "cada fecha reciente distinta con adquisiciones en el AOI (default "
+             "1: solo el mosaico más reciente). Cada mosaico contiene SOLO datos "
+             "de su fecha UTC: un tile sin cobertura ese día queda en negro, "
+             "nunca se rellena con otra fecha.",
+    )
+    parser.add_argument(
+        "--black-fraction-threshold", type=float, default=0.05,
+        help="Solo con --tile-km. Fracción de píxeles negros (nodata) en un tile "
+             "sobre la cual se loguea un warning de cobertura parcial; es solo "
+             "informativo, el negro se conserva para no mezclar fechas.",
+    )
+    parser.add_argument(
+        "--keep-tiles", action="store_true",
+        help="Solo con --tile-km. Además del mosaico, guarda cada tile individual "
+             "en '<output-dir>/tiles/' (útil para depurar coberturas parciales).",
+    )
     parser.add_argument("--no-preview", action="store_true", help="No mostrar preview con matplotlib.")
     parser.add_argument("--list-regions", action="store_true", help="Listar las regiones de Chile soportadas y salir.")
     parser.add_argument(
@@ -741,26 +1158,46 @@ def main(argv: Optional[List[str]] = None) -> int:
         parser.error("Debe indicar --bbox, --geojson, o bien --region junto con --point.")
     if bool(args.region) != bool(args.point):
         parser.error("--region y --point deben usarse juntos.")
-    if args.count is None:
-        parser.error("-n/--count es requerido.")
+    if args.tile_km is None and args.count is None:
+        parser.error("-n/--count es requerido (salvo en modo mosaico, --tile-km).")
 
     try:
-        download_latest_true_color_images(
-            n=args.count,
-            output_dir=args.output_dir,
-            region=args.region,
-            point=args.point,
-            bbox=args.bbox,
-            geojson=args.geojson,
-            buffer_km=args.buffer_km,
-            lookback_days=args.lookback_days,
-            max_lookback_days=args.max_lookback_days,
-            resolution_m=args.resolution_m,
-            max_image_dim=args.max_image_dim,
-            gain=args.gain,
-            gamma=args.gamma,
-            show_preview=not args.no_preview,
-        )
+        if args.tile_km is not None:
+            download_regional_mosaic(
+                output_dir=args.output_dir,
+                region=args.region,
+                point=args.point,
+                bbox=args.bbox,
+                geojson=args.geojson,
+                buffer_km=args.buffer_km,
+                tile_km=args.tile_km,
+                count=args.count if args.count is not None else 1,
+                max_lookback_days=args.max_lookback_days,
+                resolution_m=args.resolution_m,
+                max_image_dim=args.max_image_dim,
+                gain=args.gain,
+                gamma=args.gamma,
+                black_fraction_threshold=args.black_fraction_threshold,
+                keep_tiles=args.keep_tiles,
+                show_preview=not args.no_preview,
+            )
+        else:
+            download_latest_true_color_images(
+                n=args.count,
+                output_dir=args.output_dir,
+                region=args.region,
+                point=args.point,
+                bbox=args.bbox,
+                geojson=args.geojson,
+                buffer_km=args.buffer_km,
+                lookback_days=args.lookback_days,
+                max_lookback_days=args.max_lookback_days,
+                resolution_m=args.resolution_m,
+                max_image_dim=args.max_image_dim,
+                gain=args.gain,
+                gamma=args.gamma,
+                show_preview=not args.no_preview,
+            )
     except (AuthError, GeocodingError, CatalogError, ProcessAPIError, GeoJSONError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -789,5 +1226,11 @@ if __name__ == "__main__":
     #   # Por archivo GeoJSON (bbox extraído de la geometría)
     #   python download_sentinel2_truecolor.py --geojson ./aoi/mi_area.geojson \
     #       -n 3 --no-preview
+    #
+    #   # Mosaico en tiles para un AOI grande (p.ej. una región entera), evitando
+    #   # el corte diagonal de nodata que deja una sola imagen sobre un AOI más
+    #   # ancho que un swath de Sentinel-2
+    #   python download_sentinel2_truecolor.py --geojson ./aoi/mi_region.geojson \
+    #       --tile-km 100 --no-preview
     # ------------------------------------------------------------------------------
     sys.exit(main())
